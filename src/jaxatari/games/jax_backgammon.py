@@ -32,10 +32,8 @@ class BackgammonConstants(NamedTuple):
     WHITE_HOME = jnp.array(range(18, 24))
     BLACK_HOME = jnp.array(range(0, 6))
 
-
     WHITE = 1
     BLACK = -1
-
 
 class BackgammonState(NamedTuple):
     """Represents the complete state of a backgammon game."""
