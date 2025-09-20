@@ -204,7 +204,6 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
         # Early rejection
         early_invalid = jnp.logical_not(in_bounds) | must_move_from_bar | same_point | moving_to_bar
 
-
         def return_false(_):
             return False
 
