@@ -49,6 +49,7 @@ class BackgammonState(NamedTuple):
     cursor_position: int = 0
     picked_checker_from: int = -1
     game_phase: int = 0  # 0=WAITING_FOR_ROLL, 1=SELECTING_CHECKER, 2=MOVING_CHECKER
+    action_cooldown: int = 0  # NEW: Add cooldown timer
 
 class BackgammonInfo(NamedTuple):
     """Contains auxiliary information about the environment (e.g., timing or metadata)."""
@@ -242,7 +243,9 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
             dice=dice,
             current_player=current_player,
             is_game_over=False,
-            key=key
+            key=key,
+            cursor_position=0,
+            action_cooldown=0
         )
 
     def reset(self, key: jax.random.PRNGKey = None) -> Tuple[jnp.ndarray, BackgammonState]:
@@ -589,147 +592,75 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
 
         return obs, new_state, reward, done, info, new_key
 
-    def step(self, state: BackgammonState, action: jnp.ndarray):
-        """Handle interactive actions from play.py script."""
+    def step(self, state: BackgammonState, action: int):
+        """Perform a step in the environment using Atari action values with cursor control."""
+        from jaxatari.environment import JAXAtariAction
 
-        # Map jaxatari actions to our internal actions
-        # Action.UP (2) = cursor left
-        # Action.DOWN (3) = cursor right
-        # Action.FIRE (1) = space (select/drop/roll)
+        # Decrease cooldown
+        new_cooldown = jnp.maximum(state.action_cooldown - 1, 0)
 
-        def handle_cursor_move(state, direction):
-            """Move cursor left or right."""
-            # Only allow cursor movement in selecting/moving phases
-            can_move = (state.game_phase == 1) | (state.game_phase == 2)
+        # Check if we need to roll dice
+        needs_roll = jnp.all(state.dice == 0)
 
-            # Calculate new cursor position
-            new_pos = state.cursor_position + direction
-            # Clamp to valid range (0-25 for points + bar + home)
-            new_pos = jnp.clip(new_pos, 0, 25)
-
-            new_cursor = jax.lax.cond(
-                can_move,
-                lambda _: new_pos,
-                lambda _: state.cursor_position,
-                operand=None
-            )
-
-            new_state = state._replace(cursor_position=new_cursor)
-            return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
-
-        def handle_space(state):
-            """Handle space key based on game phase."""
-
-            def do_roll(state):
-                """Roll dice and move to selecting phase."""
+        # FIRE (space) button is NOT affected by cooldown
+        if action == JAXAtariAction.FIRE:
+            if needs_roll:
                 dice, key = self.roll_dice(state.key)
-                new_state = state._replace(
-                    dice=dice,
-                    key=key,
-                    game_phase=1  # Move to SELECTING_CHECKER
+                new_state = state._replace(dice=dice, key=key, action_cooldown=0)
+                all_rewards = self._get_all_reward(state, new_state)
+                info = self._get_info(new_state, all_rewards)
+                return (
+                    self._get_observation(new_state),
+                    new_state,
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    jnp.asarray(False),
+                    info,
                 )
+            else:
+                # Get valid moves
+                valid_moves = self.get_valid_moves(state)
+
+                if not valid_moves:
+                    # No valid moves, pass turn
+                    dice, key = self.roll_dice(state.key)
+                    new_state = state._replace(
+                        dice=dice,
+                        current_player=-state.current_player,
+                        key=key,
+                        cursor_position=0,
+                        action_cooldown=0
+                    )
+                    return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
+
+                # Execute the move at cursor position
+                if state.cursor_position < len(valid_moves):
+                    move = valid_moves[state.cursor_position]
+                    for idx, action_pair in enumerate(self._action_pairs):
+                        if tuple(action_pair) == move:
+                            move = tuple(self._action_pairs[idx])
+                            obs, new_state, reward, done, info, new_key = self.step_impl(state, move, state.key)
+                            new_state = new_state._replace(key=new_key, cursor_position=0, action_cooldown=0)
+                            return (obs, new_state, reward, done, info)
+
+        # Handle cursor movement ONLY if cooldown is 0 (this prevents fast movement)
+        can_move = new_cooldown == 0
+        move_cooldown = 5  # Frames between cursor moves (adjust this to control speed)
+
+        if can_move:
+            valid_moves = self.get_valid_moves(state)
+
+            if action == JAXAtariAction.LEFT and len(valid_moves) > 0:
+                new_cursor = jnp.maximum(state.cursor_position - 1, 0)
+                new_state = state._replace(cursor_position=new_cursor, action_cooldown=move_cooldown)
+                return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
+            elif action == JAXAtariAction.RIGHT and len(valid_moves) > 0:
+                new_cursor = jnp.minimum(state.cursor_position + 1, len(valid_moves) - 1)
+                new_state = state._replace(cursor_position=new_cursor, action_cooldown=move_cooldown)
                 return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
 
-            def do_select(state):
-                """Try to pick up a checker."""
-                player_idx = self.get_player_index(state.current_player)
-                pos = state.cursor_position
-
-                # Check if there's a checker at cursor position
-                has_checker = state.board[player_idx, pos] > 0
-
-                new_state = jax.lax.cond(
-                    has_checker,
-                    lambda s: s._replace(
-                        picked_checker_from=pos,
-                        game_phase=2  # Move to MOVING_CHECKER
-                    ),
-                    lambda s: s,  # Stay in selecting
-                    operand=state
-                )
-
-                return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
-
-            def do_drop(state):
-                """Try to drop the checker."""
-                move = (state.picked_checker_from, state.cursor_position)
-                is_valid = self.is_valid_move(state, move)
-
-                def execute_valid_move(s):
-                    # Execute the move
-                    obs, new_s, reward, done, info, key = self.step_impl(s, move, s.key)
-
-                    # Check if turn ended (all dice used)
-                    all_dice_used = jnp.all(new_s.dice == 0)
-
-                    # Update phase and cursor
-                    next_phase = jax.lax.cond(
-                        all_dice_used,
-                        lambda _: 0,  # Back to WAITING_FOR_ROLL
-                        lambda _: 1,  # Back to SELECTING_CHECKER
-                        operand=None
-                    )
-
-                    # Reset cursor position for new player if turn changed
-                    next_cursor = jax.lax.cond(
-                        new_s.current_player != s.current_player,
-                        lambda _: jax.lax.cond(
-                            new_s.current_player == self.consts.WHITE,
-                            lambda _: 0,
-                            lambda _: 23,
-                            operand=None
-                        ),
-                        lambda _: s.cursor_position,
-                        operand=None
-                    )
-
-                    final_state = new_s._replace(
-                        picked_checker_from=-1,
-                        game_phase=next_phase,
-                        cursor_position=next_cursor,
-                        key=key
-                    )
-
-                    return self._get_observation(final_state), final_state, reward, done, info
-
-                def cancel_move(s):
-                    # Invalid move - go back to selecting
-                    new_s = s._replace(
-                        picked_checker_from=-1,
-                        game_phase=1
-                    )
-                    return self._get_observation(new_s), new_s, 0.0, False, self._get_info(new_s)
-
-                return jax.lax.cond(is_valid, execute_valid_move, cancel_move, operand=state)
-
-            # Route to appropriate handler based on game phase
-            return jax.lax.switch(
-                state.game_phase,
-                [do_roll, do_select, do_drop],
-                operand=state
-            )
-
-        # Main action routing
-        is_cursor_left = action == JAXAtariAction.LEFT
-        is_cursor_right = action == JAXAtariAction.RIGHT
-        is_space = action == JAXAtariAction.FIRE
-
-        return jax.lax.cond(
-            is_cursor_left,
-            lambda s: handle_cursor_move(s, -1),
-            lambda s: jax.lax.cond(
-                is_cursor_right,
-                lambda s2: handle_cursor_move(s2, 1),
-                lambda s2: jax.lax.cond(
-                    is_space,
-                    handle_space,
-                    lambda s3: (self._get_observation(s3), s3, 0.0, False, self._get_info(s3)),  # No-op
-                    operand=s2
-                ),
-                operand=s
-            ),
-            operand=state
-        )
+        # No action or cooldown active - return current state with updated cooldown
+        new_state = state._replace(action_cooldown=new_cooldown)
+        return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
 
     @partial(jax.jit, static_argnums=(0,))
     def obs_to_flat_array(self, obs: BackgammonObservation) -> jnp.ndarray:
