@@ -177,74 +177,7 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
             key=key,
             cursor_position=initial_cursor,
             picked_checker_from=-1,
-            game_phase=0  # Start in WAITING_FOR_ROLL
-        )
-
-    @partial(jax.jit, static_argnums=(0,))
-    def init_state(self, key) -> BackgammonState:
-        board = jnp.zeros((2, 26), dtype=jnp.int32)
-        # White (player 0)
-        board = board.at[0, 0].set(2)  # point 24
-        board = board.at[0, 11].set(5)  # point 13
-        board = board.at[0, 16].set(3)  # point 8
-        board = board.at[0, 18].set(5)  # point 6
-
-        # Black (player 1)
-        board = board.at[1, 23].set(2)  # point 1
-        board = board.at[1, 12].set(5)  # point 12
-        board = board.at[1, 7].set(3)  # point 17
-        board = board.at[1, 5].set(5)  # point 19
-
-        dice = jnp.zeros(4, dtype=jnp.int32)
-
-        # The condition for the while loop
-        def cond_fun(carry):
-            white_roll, black_roll, key = carry
-            return white_roll == black_roll
-        
-        # The code to be run in the while loop
-        def body_fun(carry):
-            _, _, key = carry
-            key, subkey1, subkey2 = jax.random.split(key, 3)
-            white_roll = jax.random.randint(subkey1, (), 1, 7)
-            black_roll = jax.random.randint(subkey2, (), 1, 7)
-            return (white_roll, black_roll, key)
-
-        # Generate the first dice throw
-        key, subkey1, subkey2 = jax.random.split(key, 3)
-        white_roll = jax.random.randint(subkey1, (), 1, 7)
-        black_roll = jax.random.randint(subkey2, (), 1, 7)
-        carry = (white_roll, black_roll, key)
-
-        white_roll, black_roll, key = jax.lax.while_loop(cond_fun, body_fun, carry)
-
-        # Set the player who rolled higher
-        current_player = jax.lax.cond(
-            white_roll > black_roll,
-            lambda _: self.consts.WHITE,
-            lambda _: self.consts.BLACK,
-            operand=None
-        )
-
-        # Prepare initial dice values for that player
-        first_dice = jax.lax.cond(current_player == self.consts.WHITE, lambda _: white_roll, lambda _: black_roll, operand=None)
-        second_dice = jax.lax.cond(current_player == self.consts.WHITE, lambda _: black_roll, lambda _: white_roll, operand=None)
-
-        is_double = first_dice == second_dice
-        dice = jax.lax.cond(
-            is_double,
-            lambda _: jnp.array([first_dice] * 4),
-            lambda _: jnp.array([first_dice, second_dice, 0, 0]),
-            operand=None
-        )
-
-        return BackgammonState(
-            board=board,
-            dice=dice,
-            current_player=current_player,
-            is_game_over=False,
-            key=key,
-            cursor_position=0,
+            game_phase=0,  # Start in WAITING_FOR_ROLL
             action_cooldown=0
         )
 
@@ -581,7 +514,11 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
             is_game_over=game_over,
             key=new_key,
             last_move=(from_point, to_point),
-            last_dice=used_dice
+            last_dice=used_dice,
+            cursor_position=0,
+            picked_checker_from=-1,
+            game_phase=1,
+            action_cooldown=0
         )
 
         obs = self._get_observation(new_state)
@@ -594,7 +531,6 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
 
     def step(self, state: BackgammonState, action: int):
         """Perform a step in the environment using Atari action values with cursor control."""
-        from jaxatari.environment import JAXAtariAction
 
         # Decrease cooldown
         new_cooldown = jnp.maximum(state.action_cooldown - 1, 0)
@@ -603,7 +539,7 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
         needs_roll = jnp.all(state.dice == 0)
 
         # FIRE (space) button is NOT affected by cooldown
-        if action == JAXAtariAction.FIRE:
+        if action == 1:
             if needs_roll:
                 dice, key = self.roll_dice(state.key)
                 new_state = state._replace(dice=dice, key=key, action_cooldown=0)
@@ -649,11 +585,11 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
         if can_move:
             valid_moves = self.get_valid_moves(state)
 
-            if action == JAXAtariAction.LEFT and len(valid_moves) > 0:
+            if action == 4 and len(valid_moves) > 0:
                 new_cursor = jnp.maximum(state.cursor_position - 1, 0)
                 new_state = state._replace(cursor_position=new_cursor, action_cooldown=move_cooldown)
                 return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
-            elif action == JAXAtariAction.RIGHT and len(valid_moves) > 0:
+            elif action == 3 and len(valid_moves) > 0:
                 new_cursor = jnp.minimum(state.cursor_position + 1, len(valid_moves) - 1)
                 new_state = state._replace(cursor_position=new_cursor, action_cooldown=move_cooldown)
                 return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
