@@ -529,6 +529,7 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
 
         return obs, new_state, reward, done, info, new_key
 
+    @partial(jax.jit, static_argnums=(0,))
     def step(self, state: BackgammonState, action: int):
         """Perform a step in the environment using Atari action values with cursor control."""
 
@@ -538,9 +539,9 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
         # Check if we need to roll dice
         needs_roll = jnp.all(state.dice == 0)
 
-        # FIRE (space) button is NOT affected by cooldown
-        if action == 1:
-            if needs_roll:
+        # Handle FIRE action (action == 1)
+        def handle_fire(_):
+            def handle_fire_needs_roll(_):
                 dice, key = self.roll_dice(state.key)
                 new_state = state._replace(dice=dice, key=key, action_cooldown=0)
                 all_rewards = self._get_all_reward(state, new_state)
@@ -552,51 +553,109 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
                     jnp.asarray(False),
                     info,
                 )
-            else:
-                # Get valid moves
+
+            def handle_fire_has_dice(_):
                 valid_moves = self.get_valid_moves(state)
 
-                if not valid_moves:
-                    # No valid moves, pass turn
+                def no_valid_moves(_):
                     dice, key = self.roll_dice(state.key)
                     new_state = state._replace(
                         dice=dice,
                         current_player=-state.current_player,
                         key=key,
                         cursor_position=0,
+                        picked_checker_from=-1,
+                        game_phase=0,
                         action_cooldown=0
                     )
                     return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
 
-                # Execute the move at cursor position
-                if state.cursor_position < len(valid_moves):
-                    move = valid_moves[state.cursor_position]
-                    for idx, action_pair in enumerate(self._action_pairs):
-                        if tuple(action_pair) == move:
-                            move = tuple(self._action_pairs[idx])
-                            obs, new_state, reward, done, info, new_key = self.step_impl(state, move, state.key)
-                            new_state = new_state._replace(key=new_key, cursor_position=0, action_cooldown=0)
-                            return (obs, new_state, reward, done, info)
+                def execute_move(_):
+                    # For now, execute first valid move if cursor position is valid
+                    def valid_cursor_move(_):
+                        move = valid_moves[state.cursor_position] if state.cursor_position < len(valid_moves) else \
+                        valid_moves[0]
+                        obs, new_state, reward, done, info, new_key = self.step_impl(state, move, state.key)
+                        new_state = new_state._replace(key=new_key, cursor_position=0, action_cooldown=0)
+                        return (obs, new_state, reward, done, info)
 
-        # Handle cursor movement ONLY if cooldown is 0 (this prevents fast movement)
-        can_move = new_cooldown == 0
-        move_cooldown = 5  # Frames between cursor moves (adjust this to control speed)
+                    def invalid_cursor(_):
+                        return self._get_observation(state), state, 0.0, False, self._get_info(state)
 
-        if can_move:
+                    return jax.lax.cond(
+                        state.cursor_position < len(valid_moves),
+                        valid_cursor_move,
+                        invalid_cursor,
+                        operand=None
+                    )
+
+                return jax.lax.cond(
+                    len(valid_moves) == 0,
+                    no_valid_moves,
+                    execute_move,
+                    operand=None
+                )
+
+            return jax.lax.cond(needs_roll, handle_fire_needs_roll, handle_fire_has_dice, operand=None)
+
+        # Handle LEFT action (action == 4)
+        def handle_left(_):
+            can_move = new_cooldown == 0
             valid_moves = self.get_valid_moves(state)
 
-            if action == 4 and len(valid_moves) > 0:
+            def move_left(_):
                 new_cursor = jnp.maximum(state.cursor_position - 1, 0)
-                new_state = state._replace(cursor_position=new_cursor, action_cooldown=move_cooldown)
-                return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
-            elif action == 3 and len(valid_moves) > 0:
-                new_cursor = jnp.minimum(state.cursor_position + 1, len(valid_moves) - 1)
-                new_state = state._replace(cursor_position=new_cursor, action_cooldown=move_cooldown)
+                new_state = state._replace(cursor_position=new_cursor, action_cooldown=5)
                 return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
 
-        # No action or cooldown active - return current state with updated cooldown
-        new_state = state._replace(action_cooldown=new_cooldown)
-        return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
+            def no_move(_):
+                new_state = state._replace(action_cooldown=new_cooldown)
+                return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
+
+            return jax.lax.cond(
+                can_move & (len(valid_moves) > 0),
+                move_left,
+                no_move,
+                operand=None
+            )
+
+        # Handle RIGHT action (action == 3)
+        def handle_right(_):
+            can_move = new_cooldown == 0
+            valid_moves = self.get_valid_moves(state)
+
+            def move_right(_):
+                new_cursor = jnp.minimum(state.cursor_position + 1, len(valid_moves) - 1)
+                new_state = state._replace(cursor_position=new_cursor, action_cooldown=5)
+                return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
+
+            def no_move(_):
+                new_state = state._replace(action_cooldown=new_cooldown)
+                return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
+
+            return jax.lax.cond(
+                can_move & (len(valid_moves) > 0),
+                move_right,
+                no_move,
+                operand=None
+            )
+
+        # Default case - no action
+        def handle_default(_):
+            new_state = state._replace(action_cooldown=new_cooldown)
+            return self._get_observation(new_state), new_state, 0.0, False, self._get_info(new_state)
+
+        # Use jax.lax.switch for multiple conditions
+        def get_action_index(action):
+            return jax.lax.select(action == 1, 0,  # FIRE
+                                  jax.lax.select(action == 4, 1,  # LEFT
+                                                 jax.lax.select(action == 3, 2,  # RIGHT
+                                                                3)))  # DEFAULT
+
+        action_functions = [handle_fire, handle_left, handle_right, handle_default]
+        action_index = get_action_index(action)
+
+        return jax.lax.switch(action_index, action_functions, operand=None)
 
     @partial(jax.jit, static_argnums=(0,))
     def obs_to_flat_array(self, obs: BackgammonObservation) -> jnp.ndarray:
