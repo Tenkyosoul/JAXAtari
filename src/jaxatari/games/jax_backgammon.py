@@ -687,7 +687,7 @@ class BackgammonRenderer(JAXGameRenderer):
         self.color_board           = jnp.array([0, 0, 0], dtype=jnp.uint8)      # black board
         self.color_triangle_light  = jnp.array([0, 0, 255], dtype=jnp.uint8)    # blue points
         self.color_triangle_dark   = jnp.array([0, 200, 0], dtype=jnp.uint8)    # green points
-        self.color_white_checker   = jnp.array([255, 255, 255], dtype=jnp.uint8)  # white checkers
+        self.color_white_checker   = jnp.array([255, 255, 255], dtype=jnp.uint8) # white checkers
         self.color_black_checker   = jnp.array([255, 0, 0], dtype=jnp.uint8)     # red checkers
         self.color_border          = jnp.array([0, 200, 0], dtype=jnp.uint8)     # green bar
         
