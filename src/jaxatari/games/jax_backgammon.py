@@ -14,6 +14,7 @@ from jaxatari.environment import JaxEnvironment
 from jaxatari.renderers import JAXGameRenderer
 from jaxatari.rendering import jax_rendering_utils as jr
 import jaxatari.spaces as spaces
+from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action
 
 """
 Contributors: Ayush Bansal, Mahta Mollaeian, Anh Tuan Nguyen, Abdallah Siwar  
@@ -46,6 +47,12 @@ class BackgammonState(NamedTuple):
     key: jax.random.PRNGKey
     last_move: Tuple[int, int] = (-1, -1)
     last_dice: int = -1
+    # Interactive state
+    game_phase: int = 0  # GamePhase enum
+    cursor_position: int = 0
+    picked_checker_from: int = -1
+    current_die_index: int = 0
+    moves_made: jnp.ndarray = jnp.zeros(4, dtype=jnp.int32)
 
 class BackgammonInfo(NamedTuple):
     """Contains auxiliary information about the environment (e.g., timing or metadata)."""
@@ -85,16 +92,19 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
     JAX-based backgammon environment supporting JIT compilation and vectorized operations.
     Provides functionality for state initialization, step transitions, valid move evaluation, and observation generation.
     """
-    
+
     def __init__(self, consts: BackgammonConstants = None, reward_funcs: list[callable] = None):
         consts = consts or BackgammonConstants()
         super().__init__(consts)
 
         # Pre-compute all possible moves (indexed as a scalar in the framework)
         self._action_pairs = jnp.array([(i, j) for i in range(26) for j in range(26)], dtype=jnp.int32)
-        
-        # Reserve one extra action index for "roll dice"
+
+        # Interactive actions
         self._roll_action_index = self._action_pairs.shape[0]
+        self._cursor_left_index = self._roll_action_index + 1
+        self._cursor_right_index = self._roll_action_index + 2
+        self._space_action_index = self._roll_action_index + 3
 
         self.renderer = BackgammonRenderer(self)
         if reward_funcs is not None:
@@ -167,8 +177,8 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
             key=key
         )
 
+    @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: jax.random.PRNGKey = None) -> Tuple[jnp.ndarray, BackgammonState]:
-        print(key)
         key = jax.lax.cond(
             key is None,
             lambda _: jax.random.PRNGKey(0),
@@ -176,8 +186,12 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
             operand=None
         )
         state = self.init_state(key)
-        dice, key = self.roll_dice(key)
-        state = state._replace(dice=dice, key=key)
+        state = state._replace(
+            dice=jnp.zeros(4, dtype=jnp.int32),  # Start with no dice
+            game_phase=GamePhase.WAITING_FOR_ROLL,
+            cursor_position=0,
+            picked_checker_from=-1
+        )
         return self._get_observation(state), state
 
     @staticmethod
@@ -517,21 +531,169 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
     def step(self, state: BackgammonState, action: jnp.ndarray):
         """Perform a step in the environment using a scalar action index."""
 
-        def do_roll(_):
-            dice, key = self.roll_dice(state.key)
-            new_state = state._replace(dice=dice, key=key)
+        def map_atari_to_backgammon_action(atari_action):
+            """Map Atari-style actions to backgammon actions"""
+            # Map LEFT key to cursor left
+            cursor_left = atari_action == Action.LEFT
+            # Map RIGHT key to cursor right
+            cursor_right = atari_action == Action.RIGHT
+            # Map FIRE (space) to space action
+            space_pressed = jnp.any(jnp.array([
+                atari_action == Action.FIRE,
+                atari_action == Action.UPFIRE,
+                atari_action == Action.DOWNFIRE,
+                atari_action == Action.LEFTFIRE,
+                atari_action == Action.RIGHTFIRE,
+                atari_action == Action.UPLEFTFIRE,
+                atari_action == Action.UPRIGHTFIRE,
+                atari_action == Action.DOWNLEFTFIRE,
+                atari_action == Action.DOWNRIGHTFIRE
+            ]))
 
-            # match move-path structure/dtypes
-            all_rewards = self._get_all_reward(state, new_state)
-            info = self._get_info(new_state, all_rewards)
+            return cursor_left, cursor_right, space_pressed
 
-            return (
-                self._get_observation(new_state),
-                new_state,
-                jnp.asarray(0.0, dtype=jnp.float32),  # not a Python float
-                jnp.asarray(False),  # not a Python bool
-                info,
+        cursor_left, cursor_right, space_pressed = map_atari_to_backgammon_action(action)
+
+        def handle_cursor_left():
+            # Move cursor left in movement path
+            path = self._movement_path_for(state)
+            path_len = path.shape[0]
+            current_idx = jnp.argmax(path == state.cursor_position)
+            new_idx = jnp.maximum(current_idx - 1, 0)
+            new_cursor_pos = path[new_idx]
+
+            new_state = state._replace(cursor_position=new_cursor_pos)
+            return (self._get_observation(new_state), new_state,
+                    jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(False),
+                    self._get_info(new_state, self._get_all_reward(state, new_state)))
+
+        def handle_cursor_right():
+            # Move cursor right in movement path
+            path = self._movement_path_for(state)
+            path_len = path.shape[0]
+            current_idx = jnp.argmax(path == state.cursor_position)
+            new_idx = jnp.minimum(current_idx + 1, path_len - 1)
+            new_cursor_pos = path[new_idx]
+
+            new_state = state._replace(cursor_position=new_cursor_pos)
+            return (self._get_observation(new_state), new_state,
+                    jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(False),
+                    self._get_info(new_state, self._get_all_reward(state, new_state)))
+
+        def handle_space():
+            # Handle space based on game phase
+            def waiting_for_roll():
+                dice, starter, key = self._opening_roll(state.key)
+                new_state = state._replace(
+                    dice=dice,
+                    current_player=starter,
+                    key=key,
+                    game_phase=GamePhase.SELECTING_CHECKER,
+                    cursor_position=self._snap_cursor_start(state._replace(current_player=starter))
+                )
+                return (self._get_observation(new_state), new_state,
+                        jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(False),
+                        self._get_info(new_state, self._get_all_reward(state, new_state)))
+
+            def selecting_checker():
+                def pass_turn():
+                    dice, key = self.roll_dice(state.key)
+                    new_player = -state.current_player
+                    new_state = state._replace(
+                        dice=dice,
+                        current_player=new_player,
+                        key=key,
+                        cursor_position=self._snap_cursor_start(state._replace(current_player=new_player))
+                    )
+                    return (self._get_observation(new_state), new_state,
+                            jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(False),
+                            self._get_info(new_state, self._get_all_reward(state, new_state)))
+
+                def pick_checker():
+                    player_idx = self.get_player_index(state.current_player)
+                    pos = state.cursor_position
+                    has_checker = jnp.logical_and(
+                        jnp.logical_and(pos >= 0, pos <= 24),
+                        state.board[player_idx, pos] > 0
+                    )
+
+                    new_state = jnp.where(
+                        has_checker,
+                        state._replace(
+                            game_phase=GamePhase.MOVING_CHECKER,
+                            picked_checker_from=pos
+                        ),
+                        state
+                    )
+
+                    return (self._get_observation(new_state), new_state,
+                            jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(False),
+                            self._get_info(new_state, self._get_all_reward(state, new_state)))
+
+                return jax.lax.cond(
+                    self._has_valid_moves(state),
+                    pick_checker,
+                    pass_turn
+                )
+
+            def moving_checker():
+                move = (state.picked_checker_from, state.cursor_position)
+                is_valid = self.is_valid_move(state, jnp.array(move))
+
+                def execute_move():
+                    obs, new_state, reward, done, info, key = self.step_impl(state, move, state.key)
+                    new_state = new_state._replace(
+                        key=key,
+                        game_phase=GamePhase.SELECTING_CHECKER,
+                        picked_checker_from=-1,
+                        cursor_position=jnp.where(
+                            new_state.current_player != state.current_player,
+                            self._snap_cursor_start(new_state),
+                            state.cursor_position
+                        )
+                    )
+                    return (obs, new_state, reward, done, info)
+
+                def cancel_move():
+                    new_state = state._replace(
+                        game_phase=GamePhase.SELECTING_CHECKER,
+                        picked_checker_from=-1
+                    )
+                    return (self._get_observation(new_state), new_state,
+                            jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(False),
+                            self._get_info(new_state, self._get_all_reward(state, new_state)))
+
+                return jax.lax.cond(is_valid, execute_move, cancel_move)
+
+            return jax.lax.cond(
+                state.game_phase == GamePhase.WAITING_FOR_ROLL,
+                waiting_for_roll,
+                lambda: jax.lax.cond(
+                    state.game_phase == GamePhase.SELECTING_CHECKER,
+                    selecting_checker,
+                    moving_checker
+                )
             )
+
+        def handle_noop():
+            return (self._get_observation(state), state,
+                    jnp.asarray(0.0, dtype=jnp.float32), jnp.asarray(False),
+                    self._get_info(state, self._get_all_reward(state, state)))
+
+        # Route based on mapped actions
+        return jax.lax.cond(
+            cursor_left,
+            handle_cursor_left,
+            lambda: jax.lax.cond(
+                cursor_right,
+                handle_cursor_right,
+                lambda: jax.lax.cond(
+                    space_pressed,
+                    handle_space,
+                    handle_noop
+                )
+            )
+        )
 
         def do_move(act):
             move = tuple(self._action_pairs[act])
@@ -539,12 +701,54 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
             new_state = new_state._replace(key=new_key)
             return (obs, new_state, reward, done, info)
 
+        # Route action
         return jax.lax.cond(
-            action == self._roll_action_index,
-            do_roll,
-            do_move,
-            operand=action
+            action == self._cursor_left_index,
+            handle_cursor_left,
+            lambda: jax.lax.cond(
+                action == self._cursor_right_index,
+                handle_cursor_right,
+                lambda: jax.lax.cond(
+                    action == self._space_action_index,
+                    handle_space,
+                    lambda: do_move(action)
+                )
+            )
         )
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _opening_roll(self, key):
+        """Opening roll logic"""
+
+        # Keep rolling until different
+        def cond_fun(carry):
+            white_roll, black_roll, key = carry
+            return white_roll == black_roll
+
+        def body_fun(carry):
+            _, _, key = carry
+            key, subkey1, subkey2 = jax.random.split(key, 3)
+            white_roll = jax.random.randint(subkey1, (), 1, 7)
+            black_roll = jax.random.randint(subkey2, (), 1, 7)
+            return (white_roll, black_roll, key)
+
+        key, subkey1, subkey2 = jax.random.split(key, 3)
+        white_roll = jax.random.randint(subkey1, (), 1, 7)
+        black_roll = jax.random.randint(subkey2, (), 1, 7)
+        carry = (white_roll, black_roll, key)
+
+        white_roll, black_roll, key = jax.lax.while_loop(cond_fun, body_fun, carry)
+
+        starter = jax.lax.cond(white_roll > black_roll,
+                               lambda _: self.consts.WHITE,
+                               lambda _: self.consts.BLACK,
+                               operand=None)
+
+        first = jax.lax.cond(starter == self.consts.WHITE, lambda _: white_roll, lambda _: black_roll, operand=None)
+        second = jax.lax.cond(starter == self.consts.WHITE, lambda _: black_roll, lambda _: white_roll, operand=None)
+        dice = jnp.array([first, second, 0, 0], dtype=jnp.int32)
+
+        return dice, starter, key
 
     @partial(jax.jit, static_argnums=(0,))
     def obs_to_flat_array(self, obs: BackgammonObservation) -> jnp.ndarray:
@@ -577,8 +781,8 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
         )
 
     def action_space(self) -> spaces.Discrete:
-        """Return the discrete action space (scalar index into move list)."""
-        return spaces.Discrete(self._action_pairs.shape[0] + 1)  # +1 for roll action
+        """Return the discrete action space (scalar index into move list + interactive actions)."""
+        return spaces.Discrete(self._action_pairs.shape[0] + 4)  # +4 for roll, left, right, space
 
     def observation_space(self) -> spaces.Dict:
         """Return the observation space for the environment."""
@@ -675,6 +879,44 @@ class JaxBackgammonEnv(JaxEnvironment[BackgammonState, jnp.ndarray, dict, Backga
 
     def render(self, state: BackgammonState) -> Tuple[jnp.ndarray]:
         return self.renderer.render(state)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _movement_path_for(self, state: BackgammonState) -> jnp.ndarray:
+        """Get movement path as JAX array"""
+        player_idx = self.get_player_index(state.current_player)
+        has_bar = state.board[player_idx, 24] > 0
+        can_bear = self.check_bearing_off(state, state.current_player)
+
+        # Base clockwise path: 0..5, 6..17, 18..23
+        path = jnp.arange(0, 24)
+
+        # Add bar positions if needed (simplified for JAX)
+        path = jnp.where(has_bar,
+                         jnp.concatenate([jnp.array([24]), path, jnp.array([24])]),
+                         path)
+
+        # Add home if can bear off
+        path = jnp.where(can_bear,
+                         jnp.concatenate([jnp.array([25]), path, jnp.array([25])]),
+                         path)
+
+        return path
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _snap_cursor_start(self, state: BackgammonState) -> int:
+        """Calculate starting cursor position"""
+        player_idx = self.get_player_index(state.current_player)
+        has_bar = state.board[player_idx, 24] > 0
+
+        # If on bar, go to bar position (24), else go to 0 (White) or 23 (Black)
+        return jnp.where(has_bar, 24,
+                         jnp.where(state.current_player == self.consts.WHITE, 0, 23))
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _has_valid_moves(self, state: BackgammonState) -> bool:
+        """Check if player has any valid moves"""
+        valid_moves = jax.vmap(lambda move: self.is_valid_move(state, move))(self._action_pairs)
+        return jnp.any(valid_moves)
 
 
 class BackgammonRenderer(JAXGameRenderer):
