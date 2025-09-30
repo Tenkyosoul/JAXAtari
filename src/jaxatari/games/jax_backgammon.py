@@ -1460,7 +1460,7 @@ class BackgammonRenderer(JAXGameRenderer):
                     lambda _: self.triangle_positions[pos][1] + self.triangle_thickness // 2,
                     lambda _: jax.lax.cond(
                         is_bar_left | is_bar_right,
-                        lambda _: bar_cy,               # both bar halves
+                        lambda _: bar_cy,  # both bar halves
                         lambda _: self.bar_y + self.bar_thickness // 2,  # fallback
                         operand=None
                     ),
